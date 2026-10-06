@@ -682,12 +682,12 @@ func extractZip(zipPath, destDir string) error {
 }
 
 // findRepoRoot locates a usable git repository inside the extracted archive root.
-// It handles three layouts:
-//  1. Working tree: archive_root/<anything>/.git  (most common, e.g. `zip -r repo.zip repo/`)
-//  2. Bare repo nested: archive_root/<anything>/  where git-dir is the directory itself
-//  3. Bare repo at root: archive_root/ is itself a bare repo (HEAD + objects/ present)
+// IMPORTANT: we must NOT call git rev-parse without constraining the search
+// directory, because git traverses upward and would find the host project's
+// .git when the data directory is nested inside it.
+// Instead we use pure filesystem checks that never leave the candidate path.
 func findRepoRoot(ctx context.Context, archiveRoot string, git gitservice.Runner) (string, error) {
-	// Pass 1: look for a .git entry anywhere in the tree (fast, handles working trees).
+	// Pass 1: look for a .git entry anywhere in the tree (working-tree ZIPs).
 	var dotGit string
 	filepath.Walk(archiveRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil || dotGit != "" {
@@ -700,20 +700,26 @@ func findRepoRoot(ctx context.Context, archiveRoot string, git gitservice.Runner
 		return nil
 	})
 	if dotGit != "" {
-		// .git file (gitlink) or .git directory: the repo root is the parent.
 		repoRoot := filepath.Dir(dotGit)
-		if err := git.ValidateRepo(ctx, repoRoot); err == nil {
+		fi, err := os.Stat(dotGit)
+		if err == nil {
+			if fi.IsDir() {
+				// .git directory — classic working tree
+				return repoRoot, nil
+			}
+			// .git file — gitlink (submodule / worktree pointer)
+			// Trust it; the real git-dir is elsewhere but the work-tree is here.
 			return repoRoot, nil
 		}
 	}
 
-	// Pass 2: try the archive root itself (bare repo at top level).
-	if err := git.ValidateRepo(ctx, archiveRoot); err == nil {
+	// Pass 2: archive root itself is a bare repo.
+	if looksLikeBareRepo(archiveRoot) {
 		return archiveRoot, nil
 	}
 
-	// Pass 3: try each immediate subdirectory (bare repo one level down,
-	// e.g. `zip -r repo.zip repo.git/` where repo.git/ is a bare clone).
+	// Pass 3: a single immediate subdirectory is a bare repo
+	// (e.g. zip -r repo.zip repo.git/).
 	entries, err := os.ReadDir(archiveRoot)
 	if err != nil {
 		return "", fmt.Errorf("cannot list archive contents: %w", err)
@@ -723,13 +729,32 @@ func findRepoRoot(ctx context.Context, archiveRoot string, git gitservice.Runner
 			continue
 		}
 		candidate := filepath.Join(archiveRoot, e.Name())
-		if err := git.ValidateRepo(ctx, candidate); err == nil {
+		if looksLikeBareRepo(candidate) {
 			return candidate, nil
 		}
 	}
 
-	return "", fmt.Errorf("no git repository detected in archive")
+	return "", fmt.Errorf("the archive does not contain a git repository (.git directory not found and no bare-repo structure detected). Please upload a ZIP that was created from a git clone, not a GitHub source download")
 }
+
+// looksLikeBareRepo checks whether dir contains the core files of a bare git
+// repository WITHOUT invoking git (which would traverse parent directories).
+// A bare repo always has: HEAD, objects/, refs/
+func looksLikeBareRepo(dir string) bool {
+	for _, name := range []string{"HEAD", "objects", "refs"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			return false
+		}
+	}
+	// Make sure HEAD actually looks like a git HEAD file.
+	head, err := os.ReadFile(filepath.Join(dir, "HEAD"))
+	if err != nil {
+		return false
+	}
+	s := strings.TrimSpace(string(head))
+	return strings.HasPrefix(s, "ref: ") || (len(s) == 40 || len(s) == 64) // ref or detached SHA
+}
+
 
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
