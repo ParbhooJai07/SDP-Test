@@ -248,6 +248,16 @@ func uploadRepo(deps Dependencies) http.HandlerFunc {
 
 			destPath := filepath.Join(deps.DataDir, "repos", fmt.Sprintf("%d", repo.ID))
 
+			// Detect GitHub source archives BEFORE extraction: they have no git
+			// history and cannot be analysed. Return a targeted error immediately.
+			if hint := detectGitHubSourceZip(bgPath); hint != "" {
+				msg := "This looks like a GitHub source download (no git history). " +
+					"Use \"Clone from URL\" with the repository URL instead. " + hint
+				deps.Store.FailJob(ctx, job.ID, msg)
+				deps.Store.UpdateRepositoryStatus(ctx, repo.ID, domain.RepositoryStatusFailed, msg)
+				return
+			}
+
 			if err := extractZip(bgPath, destPath); err != nil {
 				deps.Logger.Error("extract zip failed", "repoID", repo.ID, "error", err)
 				deps.Store.FailJob(ctx, job.ID, "Failed to extract ZIP: "+err.Error())
@@ -261,8 +271,11 @@ func uploadRepo(deps Dependencies) http.HandlerFunc {
 			//   • Bare / mirror repos where git objects live at the top level
 			repoRoot, err := findRepoRoot(ctx, destPath, deps.Git)
 			if err != nil {
-				deps.Store.FailJob(ctx, job.ID, "No git repository found in archive: "+err.Error())
-				deps.Store.UpdateRepositoryStatus(ctx, repo.ID, domain.RepositoryStatusFailed, "No git repository found in archive.")
+				msg := "No git repository found in archive. " +
+					"Upload a ZIP created from \"git clone\", not a GitHub source download. " +
+					"Use \"Clone from URL\" to import directly from GitHub."
+				deps.Store.FailJob(ctx, job.ID, msg)
+				deps.Store.UpdateRepositoryStatus(ctx, repo.ID, domain.RepositoryStatusFailed, msg)
 				return
 			}
 
@@ -645,6 +658,56 @@ func parseOptionalInt64(r *http.Request, key string) *int64 {
 }
 
 // ── ZIP extraction ──
+
+// detectGitHubSourceZip returns a non-empty hint string when zipPath looks like
+// a GitHub "Download ZIP" source archive (no git history). GitHub source ZIPs:
+//   - have a single top-level directory named "<repo>-<branch>" or "<repo>-<sha>"
+//   - contain no .git entry
+//   - optionally carry a ZIP comment that is a 40-char commit SHA
+//
+// Returns "" when the ZIP may contain a real git repository.
+func detectGitHubSourceZip(zipPath string) string {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return ""
+	}
+	defer r.Close()
+
+	hasGit := false
+	topDirs := map[string]struct{}{}
+	for _, f := range r.File {
+		name := filepath.ToSlash(f.Name)
+		if strings.Contains(name, ".git") {
+			hasGit = true
+			break
+		}
+		// Collect unique top-level directory names
+		parts := strings.SplitN(name, "/", 2)
+		if len(parts) >= 1 && parts[0] != "" {
+			topDirs[parts[0]] = struct{}{}
+		}
+	}
+
+	if hasGit {
+		return ""
+	}
+
+	// GitHub source ZIPs always have exactly one top-level directory.
+	if len(topDirs) != 1 {
+		return ""
+	}
+	for topDir := range topDirs {
+		// GitHub names it "<repo>-<branch>" e.g. "cJSON-master"
+		// Extract the repo name (everything before the last dash).
+		if idx := strings.LastIndex(topDir, "-"); idx > 0 {
+			repoName := topDir[:idx]
+			return fmt.Sprintf(
+				"Suggested URL: https://github.com/<username>/%s.git", repoName,
+			)
+		}
+	}
+	return "This appears to be a source-only archive with no git history."
+}
 
 func extractZip(zipPath, destDir string) error {
 	reader, err := zip.OpenReader(zipPath)
