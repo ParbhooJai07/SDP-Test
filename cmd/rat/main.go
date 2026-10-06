@@ -3,15 +3,18 @@ package main
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/sdp-test/repo-analysis-tool/internal/api"
 	"github.com/sdp-test/repo-analysis-tool/internal/config"
+	"github.com/sdp-test/repo-analysis-tool/internal/gitservice"
 	"github.com/sdp-test/repo-analysis-tool/internal/store"
 )
 
@@ -39,10 +42,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler := api.NewRouter(api.Dependencies{Store: db, Logger: logger})
+	git := gitservice.NewRunner()
+
+	apiRouter := api.NewRouter(api.Dependencies{
+		Store:   db,
+		Logger:  logger,
+		DataDir: cfg.DataDir,
+		Git:     git,
+	})
+
+	// Compose: API routes + static file serving for React SPA
+	mux := http.NewServeMux()
+
+	// Try to serve web/dist as static files
+	staticDir := "web/dist"
+	if _, err := os.Stat(staticDir); err == nil {
+		spa := spaHandler{staticDir: http.Dir(staticDir), apiHandler: apiRouter}
+		mux.Handle("/", spa)
+	} else {
+		// No static build; just serve API
+		mux.Handle("/", apiRouter)
+	}
+
 	server := &http.Server{
 		Addr:              cfg.ListenAddress,
-		Handler:           handler,
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -61,4 +85,36 @@ func main() {
 		logger.Error("shutdown failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+type spaHandler struct {
+	staticDir  http.FileSystem
+	apiHandler http.Handler
+}
+
+func (h spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// API routes go to the API handler
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		h.apiHandler.ServeHTTP(w, r)
+		return
+	}
+
+	// Try to serve the file
+	path := r.URL.Path
+	if path == "/" {
+		path = "/index.html"
+	}
+	f, err := h.staticDir.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// SPA fallback: serve index.html
+			r.URL.Path = "/"
+			http.FileServer(h.staticDir).ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	f.Close()
+	http.FileServer(h.staticDir).ServeHTTP(w, r)
 }
