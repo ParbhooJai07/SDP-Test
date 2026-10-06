@@ -1,0 +1,26 @@
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Runtime data
+/data/
+/imports/
+/tmp/
+*.sqlite
+*.sqlite-*
+
+# Go
+/bin/
+*.test
+coverage.out
+
+# Node/Vite
+web/node_modules/
+web/dist/
+web/.vite/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
