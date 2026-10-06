@@ -305,7 +305,20 @@ func reanalyzeRepo(deps Dependencies) http.HandlerFunc {
 
 		go func() {
 			ctx := context.Background()
-			analysis.AnalyzeRepository(ctx, repo.ID, repoPath, "HEAD", deps.Store, job.ID, deps.Git, deps.Logger)
+			// For uploaded repos the LocalPath may point to the raw extraction
+			// directory. Re-run findRepoRoot so we never accidentally traverse up
+			// to the host project's .git.
+			actualPath := repoPath
+			if repo.SourceType == "upload" {
+				if found, err := findRepoRoot(ctx, repoPath, deps.Git); err == nil {
+					actualPath = found
+				} else {
+					deps.Store.FailJob(ctx, job.ID, "No git repository found: "+err.Error())
+					deps.Store.UpdateRepositoryStatus(ctx, repo.ID, domain.RepositoryStatusFailed, "No git repository found in archive.")
+					return
+				}
+			}
+			analysis.AnalyzeRepository(ctx, repo.ID, actualPath, "HEAD", deps.Store, job.ID, deps.Git, deps.Logger)
 		}()
 
 		w.WriteHeader(http.StatusAccepted)

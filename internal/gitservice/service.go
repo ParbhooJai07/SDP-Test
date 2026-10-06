@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -60,6 +62,14 @@ func (r Runner) Run(ctx context.Context, workDir string, args ...string) (Result
 	cmd := exec.CommandContext(ctx, bin, args...)
 	if workDir != "" {
 		cmd.Dir = workDir
+		// Prevent git from traversing up past workDir to find a parent .git.
+		// This stops uploaded-repo analysis from accidentally picking up the
+		// host project's repository when the data dir lives inside it.
+		parent := workDir
+		if p := filepath.Dir(workDir); p != workDir {
+			parent = p
+		}
+		cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+parent)
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
